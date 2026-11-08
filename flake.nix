@@ -10,6 +10,16 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
       in {
+        devShells.default = pkgs.mkShell {
+          buildInputs = with pkgs; [
+            rustc
+            cargo
+            rustfmt
+            clippy
+            rust-analyzer
+          ];
+        };
+
         packages = rec {
           linaudit = pkgs.callPackage ./nix/package.nix {};
           default = linaudit;
