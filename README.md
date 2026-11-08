@@ -25,6 +25,11 @@ is wrong, how serious it is, and how to fix it. It works on Debian, Ubuntu, RHEL
 sudo apt install linaudit
 ```
 
+**Nix package manager** (with flakes enabled):
+```bash
+sudo nix run github:alexiarstein/linaudit
+```
+
 **From source** (needs Rust 1.85 or newer):
 
 ```bash
