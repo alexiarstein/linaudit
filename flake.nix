@@ -11,7 +11,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in {
         packages = rec {
-          linaudit = pkgs.callPackage ./nix/package.nix;
+          linaudit = pkgs.callPackage ./nix/package.nix {};
           default = linaudit;
         };
       }
