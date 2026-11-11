@@ -383,7 +383,13 @@ fn grep_tree(ctx: &Context, dir: &str, re: &Regex, exclude: Option<&Regex>, max:
 }
 
 fn web(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
-    if let Some(ap) = ["/etc/apache2", "/etc/httpd"].into_iter().find(|d| ctx.path(d).is_dir()) {
+    // Apache se detecta por su config principal, no por el directorio: en Debian
+    // javascript-common deja /etc/apache2/conf-available/ aunque Apache no esté instalado.
+    let apache = [("/etc/apache2", "/etc/apache2/apache2.conf"), ("/etc/httpd", "/etc/httpd/conf/httpd.conf")]
+        .into_iter()
+        .find(|(_, conf)| ctx.path(conf).is_file())
+        .map(|(dir, _)| dir);
+    if let Some(ap) = apache {
         detected.push("apache");
         let tokens = Regex::new(r"^[[:space:]]*ServerTokens[[:space:]]+(Prod|ProductOnly)").expect("regex válida");
         if grep_tree(ctx, ap, &tokens, None, 1).is_empty() {
@@ -513,5 +519,16 @@ mod tests {
         assert_eq!(r["APP-053"].detail, "/etc/nginx/sites-available/default:2");
         assert!(!r.contains_key("APP-021"), "sin docker no se mira el grupo");
         assert_eq!(r["APP-000"].title, "Aplicaciones detectadas: postgresql samba apache nginx");
+    }
+
+    #[test]
+    fn javascript_common_no_es_apache() {
+        // Debian: javascript-common deja este conffile sin que Apache esté instalado.
+        let f = Fixture::new();
+        f.file("/etc/apache2/conf-available/javascript-common.conf", "Alias /javascript /usr/share/javascript/\n");
+        let r = f.run(run);
+        assert!(!r.contains_key("APP-050"), "sin apache2.conf no hay Apache");
+        assert!(!r.contains_key("APP-051"));
+        assert_eq!(r["APP-000"].title, "Aplicaciones detectadas: ninguna");
     }
 }
