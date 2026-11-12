@@ -401,6 +401,52 @@ pub fn expand_all(ctx: &Context, patterns: &[&str]) -> Vec<String> {
     patterns.iter().flat_map(|p| expand(ctx, p)).collect()
 }
 
+/// Resuelve `path` (ruta lógica absoluta del sistema auditado) siguiendo los symlinks,
+/// pero manteniendo cada salto DENTRO de la raíz auditada: un target absoluto se interpreta
+/// contra la raíz (no contra el `/` real), como si esa raíz fuese `/`, y uno relativo contra
+/// el directorio del symlink. Un `..` nunca sube por encima de la raíz. Devuelve la ruta
+/// lógica del archivo real (ya sin symlinks), o `None` si un componente no existe o hay un
+/// ciclo de symlinks. Es lo que impide que un symlink hostil saque al auditor del árbol
+/// auditado (p. ej. en una auditoría offline con fs_root=/mnt, un enlace absoluto a /etc/shadow
+/// se lee de la imagen montada, no del host).
+pub fn resolve_in_root(ctx: &Context, path: &str) -> Option<String> {
+    resolve_in_root_hops(ctx, path, &mut 0)
+}
+
+fn resolve_in_root_hops(ctx: &Context, path: &str, hops: &mut usize) -> Option<String> {
+    let mut real = String::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                // Subir un nivel, sin pasar nunca por encima de la raíz.
+                match real.rfind('/') {
+                    Some(i) => real.truncate(i),
+                    None => real.clear(),
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let candidate = format!("{real}/{comp}");
+        let meta = std::fs::symlink_metadata(ctx.path(&candidate)).ok()?;
+        if meta.file_type().is_symlink() {
+            *hops += 1;
+            if *hops > 40 {
+                return None; // ciclo de symlinks
+            }
+            let target = std::fs::read_link(ctx.path(&candidate)).ok()?;
+            let target = target.to_string_lossy();
+            // Absoluto: contra la raíz auditada. Relativo: contra el directorio del symlink.
+            let next = if target.starts_with('/') { target.into_owned() } else { format!("{real}/{target}") };
+            real = resolve_in_root_hops(ctx, &next, hops)?;
+        } else {
+            real = candidate;
+        }
+    }
+    Some(real)
+}
+
 /// Líneas que coinciden con `re` en cada archivo, como `grep -Hn`: (archivo, n° de línea, línea).
 /// `max_per_file` imita `-m`; los archivos binarios se saltean (como `-I`).
 pub fn grep_files(
@@ -483,5 +529,43 @@ mod tests {
         assert!(mode_within(0o640, 0o640));
         assert!(!mode_within(0o644, 0o640));
         assert!(!mode_within(0o4755, 0o755));
+    }
+
+    #[test]
+    fn resolve_in_root_sigue_symlink_relativo() {
+        // El caso Debian (a2enconf/a2ensite): conf-enabled/x.conf -> ../conf-available/x.conf.
+        let f = crate::checks::fixture::Fixture::new();
+        f.file("/etc/apache2/conf-available/sec.conf", "ServerTokens Prod\n")
+            .symlink("/etc/apache2/conf-enabled/sec.conf", "../conf-available/sec.conf");
+        let ctx = f.ctx();
+        assert_eq!(
+            resolve_in_root(&ctx, "/etc/apache2/conf-enabled/sec.conf").as_deref(),
+            Some("/etc/apache2/conf-available/sec.conf")
+        );
+    }
+
+    #[test]
+    fn resolve_in_root_reenraiza_symlink_absoluto() {
+        // Un target ABSOLUTO se interpreta contra la raíz auditada, no contra el `/` real:
+        // en una auditoría offline esto lee la copia de la imagen, no la del host.
+        let f = crate::checks::fixture::Fixture::new();
+        f.file("/etc/apache2/conf-available/sec.conf", "ServerTokens Prod\n")
+            .symlink("/etc/apache2/conf-enabled/sec.conf", "/etc/apache2/conf-available/sec.conf");
+        let ctx = f.ctx();
+        assert_eq!(
+            resolve_in_root(&ctx, "/etc/apache2/conf-enabled/sec.conf").as_deref(),
+            Some("/etc/apache2/conf-available/sec.conf")
+        );
+    }
+
+    #[test]
+    fn resolve_in_root_no_escapa_de_la_raiz() {
+        // Un symlink que intenta escapar con muchos `..` queda clampeado a la raíz: nunca
+        // se sale del árbol auditado hacia el `/` real.
+        let f = crate::checks::fixture::Fixture::new();
+        f.file("/etc/target.conf", "x")
+            .symlink("/etc/apache2/evil.conf", "../../../../../../etc/target.conf");
+        let ctx = f.ctx();
+        assert_eq!(resolve_in_root(&ctx, "/etc/apache2/evil.conf").as_deref(), Some("/etc/target.conf"));
     }
 }

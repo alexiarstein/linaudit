@@ -50,6 +50,16 @@ impl Fixture {
         self
     }
 
+    /// Crea `abs` como un symlink a `target` (tal cual, relativo o absoluto): sirve para
+    /// modelar los drop-in `*-enabled` de Apache/nginx.
+    pub fn symlink(&self, abs: &str, target: &str) -> &Self {
+        let p = self.root.join(abs.trim_start_matches('/'));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        std::os::unix::fs::symlink(target, &p).unwrap();
+        self
+    }
+
     pub fn service(&mut self, name: &str) -> &mut Self {
         self.services.insert(name.to_string());
         self

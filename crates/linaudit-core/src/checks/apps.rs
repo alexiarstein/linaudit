@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use regex::{Regex, RegexBuilder};
 
 use super::Context;
-use super::util::{expand_all, find_command, live_command_full, read};
+use super::util::{expand, expand_all, find_command, live_command_full, read, resolve_in_root};
 use super::walk::{WalkOpts, glob_match, walk};
 use crate::model::{Emitter, ResultExt, Severity::*};
 use crate::trc;
@@ -361,7 +361,10 @@ fn samba(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
     }
 }
 
-/// Como `grep -r`: archivos de un árbol sin seguir symlinks, en orden de recorrido.
+/// Como `grep -r`: archivos de un árbol sin seguir symlinks. El recorrido de `read_dir`
+/// no tiene orden garantizado, así que ordenamos las rutas para que el resultado sea
+/// determinista: de lo contrario el "último" entre archivos (ver `last_directive`)
+/// dependería del sistema de archivos y el veredicto podría cambiar entre corridas.
 fn tree_files(ctx: &Context, dir: &str) -> Vec<String> {
     let mut v = Vec::new();
     walk(ctx, dir, &WalkOpts::default(), &mut |e| {
@@ -369,6 +372,7 @@ fn tree_files(ctx: &Context, dir: &str) -> Vec<String> {
             v.push(e.path.to_string());
         }
     });
+    v.sort();
     v
 }
 
@@ -382,24 +386,253 @@ fn grep_tree(ctx: &Context, dir: &str, re: &Regex, exclude: Option<&Regex>, max:
         .collect()
 }
 
+/// Argumento de un `Include`/`IncludeOptional` de Apache (sin comillas), o `None` si la línea
+/// no es uno. El nombre de la directiva no distingue mayúsculas.
+fn apache_include_arg(line: &str) -> Option<String> {
+    let mut w = line.trim().split_whitespace();
+    let k = w.next()?.to_ascii_lowercase();
+    if k != "include" && k != "includeoptional" {
+        return None;
+    }
+    Some(w.next()?.trim_matches('"').to_string())
+}
+
+/// Archivos de Apache en ORDEN DE CARGA a partir de `main_conf`: expande cada `Include`/
+/// `IncludeOptional` en su sitio (orden léxico del glob) siguiendo los symlinks `*-enabled`
+/// dentro de la raíz auditada, de modo que un `conf-available`/`sites-available` NO enlazado
+/// no se carga. Las rutas relativas son relativas al ServerRoot (el directorio de Apache).
+/// Devuelve (archivo, nº de línea, línea) en el orden en que Apache las lee; un archivo ya
+/// visto no se repite (corta ciclos de Include).
+fn apache_loaded_lines(ctx: &Context, server_root: &str, main_conf: &str) -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    apache_load(ctx, server_root, main_conf, &mut out, &mut seen, 0);
+    out
+}
+
+fn apache_load(
+    ctx: &Context,
+    server_root: &str,
+    path: &str,
+    out: &mut Vec<(String, usize, String)>,
+    seen: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > 25 {
+        return;
+    }
+    let Some(real) = resolve_in_root(ctx, path) else { return };
+    if !seen.insert(real.clone()) {
+        return;
+    }
+    // Un Include de un directorio carga todos sus archivos, en orden.
+    if ctx.path(&real).is_dir() {
+        for f in tree_files(ctx, &real) {
+            apache_load(ctx, server_root, &f, out, seen, depth + 1);
+        }
+        return;
+    }
+    let Some(text) = read(ctx, &real) else { return };
+    for (i, line) in text.lines().enumerate() {
+        if let Some(arg) = apache_include_arg(line) {
+            let pattern = if arg.starts_with('/') { arg } else { format!("{}/{}", server_root.trim_end_matches('/'), arg) };
+            for m in expand(ctx, &pattern) {
+                apache_load(ctx, server_root, &m, out, seen, depth + 1);
+            }
+        } else {
+            out.push((real.clone(), i + 1, line.to_string()));
+        }
+    }
+}
+
+/// Argumento de un `include` de nginx (sin `;` ni comillas), o `None`. nginx distingue
+/// mayúsculas, así que la directiva es `include` en minúscula.
+fn nginx_include_arg(line: &str) -> Option<String> {
+    let rest = line.split('#').next().unwrap_or("").trim().strip_prefix("include")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches(';').trim().trim_matches('"').to_string())
+}
+
+/// Líneas de nginx en ORDEN DE CARGA a partir de `main_conf`: expande cada `include` en su
+/// sitio siguiendo los symlinks (sites-enabled) dentro de la raíz auditada, de modo que
+/// `sites-available` no se lee. Las rutas relativas son relativas al prefijo /etc/nginx.
+fn nginx_loaded_lines(ctx: &Context, main_conf: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    nginx_load(ctx, main_conf, &mut out, &mut seen, 0);
+    out
+}
+
+fn nginx_load(ctx: &Context, path: &str, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, depth: usize) {
+    if depth > 25 {
+        return;
+    }
+    let Some(real) = resolve_in_root(ctx, path) else { return };
+    if !seen.insert(real.clone()) {
+        return;
+    }
+    if ctx.path(&real).is_dir() {
+        for f in tree_files(ctx, &real) {
+            nginx_load(ctx, &f, out, seen, depth + 1);
+        }
+        return;
+    }
+    let Some(text) = read(ctx, &real) else { return };
+    for line in text.lines() {
+        if let Some(arg) = nginx_include_arg(line) {
+            let pattern = if arg.starts_with('/') { arg } else { format!("/etc/nginx/{arg}") };
+            for m in expand(ctx, &pattern) {
+                nginx_load(ctx, &m, out, seen, depth + 1);
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+}
+
+/// Recorre la configuración de nginx ya cargada (en orden), contando llaves para conocer el
+/// contexto. Devuelve (hay algún `server_tokens on|build` en cualquier contexto, hay un
+/// `server_tokens off` directamente en el contexto http). nginx hereda http -> server ->
+/// location, así que un `off` a nivel http cubre todo; un `on` en cualquier contexto expone
+/// la versión (y un `off` solo dentro de un server deja expuestos los demás).
+///
+/// Las llaves literales no desincronizan el contexto: se ignoran las que están dentro de
+/// cadenas entre comillas ("..." o '...'), y una `{` que es un cuantificador de regex (va
+/// pegada a un token y encierra solo dígitos/comas: `{4}`, `{3,5}`, `{3,}`) no abre bloque,
+/// como en `location ~ "^/[0-9]{4}/"` o un `map` con `~\d{3}`.
+fn nginx_server_tokens(content: &str) -> (bool, bool) {
+    fn flush(cur: &mut String, toks: &mut Vec<String>) {
+        if !cur.is_empty() {
+            toks.push(std::mem::take(cur));
+        }
+    }
+    /// Si `chars[open]` ('{') es un cuantificador de regex, devuelve el índice de su '}' de
+    /// cierre. Debe ir pegado a un token (sin espacio antes: `cur` no vacío) y encerrar solo
+    /// dígitos y comas con al menos un dígito.
+    fn quantifier_end(chars: &[char], open: usize, cur: &str) -> Option<usize> {
+        if cur.is_empty() {
+            return None; // precedido por espacio: abre un bloque, no es cuantificador
+        }
+        let mut j = open + 1;
+        let mut saw_digit = false;
+        while j < chars.len() {
+            match chars[j] {
+                '0'..='9' => saw_digit = true,
+                ',' => {}
+                '}' => return saw_digit.then_some(j),
+                _ => return None,
+            }
+            j += 1;
+        }
+        None
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let mut stack: Vec<String> = Vec::new();
+    let mut toks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut has_on, mut off_http) = (false, false);
+    let mut quote: Option<char> = None;
+    let mut in_comment = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            cur.push(ch);
+            // nginx admite `\"` y `\'` dentro de una cadena: la barra escapa al siguiente
+            // carácter, así que una comilla escapada no cierra la cadena (si no, se tragaría
+            // el resto del archivo y se perdería un server_tokens posterior).
+            if ch == '\\' {
+                if let Some(next) = chars.get(i + 1) {
+                    cur.push(*next);
+                    i += 2;
+                    continue;
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '#' => in_comment = true,
+            '{' => {
+                if let Some(end) = quantifier_end(&chars, i, &cur) {
+                    // Cuantificador de regex: texto literal del token, no abre contexto.
+                    cur.extend(&chars[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+                flush(&mut cur, &mut toks);
+                stack.push(toks.first().cloned().unwrap_or_default());
+                toks.clear();
+            }
+            '}' => {
+                flush(&mut cur, &mut toks);
+                toks.clear();
+                stack.pop();
+            }
+            ';' => {
+                flush(&mut cur, &mut toks);
+                if toks.first().map(String::as_str) == Some("server_tokens") {
+                    match toks.get(1).map(String::as_str) {
+                        Some("on" | "build") => has_on = true,
+                        Some("off") if stack.last().map(String::as_str) == Some("http") => off_http = true,
+                        _ => {}
+                    }
+                }
+                toks.clear();
+            }
+            c if c.is_whitespace() => flush(&mut cur, &mut toks),
+            c => cur.push(c),
+        }
+        i += 1;
+    }
+    (has_on, off_http)
+}
+
 fn web(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
     // Apache se detecta por su config principal, no por el directorio: en Debian
     // javascript-common deja /etc/apache2/conf-available/ aunque Apache no esté instalado.
     let apache = [("/etc/apache2", "/etc/apache2/apache2.conf"), ("/etc/httpd", "/etc/httpd/conf/httpd.conf")]
         .into_iter()
-        .find(|(_, conf)| ctx.path(conf).is_file())
-        .map(|(dir, _)| dir);
-    if let Some(ap) = apache {
+        .find(|(_, conf)| ctx.path(conf).is_file());
+    if let Some((ap_dir, main_conf)) = apache {
         detected.push("apache");
-        let tokens = Regex::new(r"^[[:space:]]*ServerTokens[[:space:]]+(Prod|ProductOnly)").expect("regex válida");
-        if grep_tree(ctx, ap, &tokens, None, 1).is_empty() {
-            em.warn("APP-050", Low, tr!("Apache exposes its version (ServerTokens)")).with_detail(ap).with_fix(tr!("ServerTokens Prod and ServerSignature Off"));
-        } else {
+        // Orden de carga real: Apache expande Include/IncludeOptional en su sitio y solo carga
+        // los *-enabled enlazados; gana la última ServerTokens cargada (una insegura escrita
+        // después anula a una segura anterior). Los nombres de directiva no distinguen
+        // mayúsculas. Un conf-available/sites-available sin enlazar no carga, así que no cuenta.
+        let lines = apache_loaded_lines(ctx, ap_dir, main_conf);
+        let tokens_name = ci(r"^[[:space:]]*ServerTokens[[:space:]]+");
+        let tokens_prod = ci(r"^[[:space:]]*ServerTokens[[:space:]]+(ProductOnly|Prod)\b");
+        let last = lines.iter().rev().find(|(_, _, l)| tokens_name.is_match(l));
+        if last.is_some_and(|(_, _, l)| tokens_prod.is_match(l)) {
             em.pass("APP-050", Low, "Apache: ServerTokens Prod");
+        } else {
+            em.warn("APP-050", Low, tr!("Apache exposes its version (ServerTokens)")).with_detail(ap_dir).with_fix(tr!("ServerTokens Prod and ServerSignature Off"));
         }
-        let indexes = Regex::new(r"^[[:space:]]*Options[[:space:]].*[[:space:]+]?Indexes").expect("regex válida");
-        let minus = Regex::new(r"Options.*-Indexes").expect("regex válida");
-        let x = grep_tree(ctx, ap, &indexes, Some(&minus), 5);
+        // Mismo conjunto de archivos cargados: así no se delata un vhost deshabilitado.
+        let indexes = ci(r"^[[:space:]]*Options[[:space:]].*[[:space:]+]?Indexes");
+        let minus = ci(r"Options.*-Indexes");
+        let x: Vec<String> = lines
+            .iter()
+            .filter(|(_, _, l)| indexes.is_match(l) && !minus.is_match(l))
+            .take(5)
+            .map(|(f, n, _)| format!("{f}:{n}"))
+            .collect();
         if x.is_empty() {
             em.pass("APP-051", Medium, tr!("Apache: no directory listing (Options Indexes)"));
         } else {
@@ -408,13 +641,17 @@ fn web(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
     }
     if ctx.path("/etc/nginx").is_dir() {
         detected.push("nginx");
-        let tokens = Regex::new(r"^[[:space:]]*server_tokens[[:space:]]+off").expect("regex válida");
-        if grep_tree(ctx, "/etc/nginx", &tokens, None, 1).is_empty() {
-            em.warn("APP-052", Low, tr!("nginx exposes its version (server_tokens)")).with_detail("/etc/nginx").with_fix("server_tokens off;");
-        } else {
+        // nginx no admite last-wins (un server_tokens duplicado en un contexto es un error de
+        // arranque); hereda http -> server -> location. Seguimos los `include` desde nginx.conf
+        // (sin leer sites-available) y advertimos si algún archivo cargado tiene server_tokens
+        // on|build, o si no hay un server_tokens off en el contexto http.
+        let (has_on, off_http) = nginx_server_tokens(&nginx_loaded_lines(ctx, "/etc/nginx/nginx.conf").join("\n"));
+        if !has_on && off_http {
             em.pass("APP-052", Low, "nginx: server_tokens off");
+        } else {
+            em.warn("APP-052", Low, tr!("nginx exposes its version (server_tokens)")).with_detail("/etc/nginx").with_fix("server_tokens off; at the http level");
         }
-        let auto = Regex::new(r"^[[:space:]]*autoindex[[:space:]]+on").expect("regex válida");
+        let auto = ci(r"^[[:space:]]*autoindex[[:space:]]+on");
         let x = grep_tree(ctx, "/etc/nginx", &auto, None, 5);
         if x.is_empty() {
             em.pass("APP-053", Medium, tr!("nginx: no autoindex"));
@@ -530,5 +767,177 @@ mod tests {
         assert!(!r.contains_key("APP-050"), "sin apache2.conf no hay Apache");
         assert!(!r.contains_key("APP-051"));
         assert_eq!(r["APP-000"].title, "Aplicaciones detectadas: ninguna");
+    }
+
+    #[test]
+    fn apache_servertokens_ultima_gana() {
+        // Prod primero, Full después: la última directiva manda, así que expone la versión.
+        // En un solo archivo el orden de línea es determinista (el recorrido entre
+        // archivos depende del sistema de archivos).
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "ServerTokens Prod\nServerTokens Full\n");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Warn, "una Full posterior anula a Prod");
+    }
+
+    #[test]
+    fn apache_servertokens_no_distingue_mayusculas() {
+        // El nombre de directiva de Apache es case-insensitive: 'servertokens prod' es seguro.
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "servertokens prod\n");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Pass);
+    }
+
+    #[test]
+    fn nginx_server_tokens_ultima_gana() {
+        // off primero, on después: la última gana, así que expone la versión.
+        let f = Fixture::new();
+        f.file("/etc/nginx/nginx.conf", "http {\n\tserver_tokens off;\n\tserver {\n\t\tserver_tokens on;\n\t}\n}\n");
+        assert_eq!(f.run(run)["APP-052"].status, Status::Warn, "un on posterior anula a off");
+    }
+
+    #[test]
+    fn tree_files_orden_determinista() {
+        // read_dir no garantiza orden; tree_files debe devolver las rutas ordenadas
+        // para que el "último" entre archivos no dependa del sistema de archivos.
+        let f = Fixture::new();
+        f.file("/r/b.conf", "x").file("/r/a.conf", "x").file("/r/sub/c.conf", "x");
+        let ctx = f.ctx();
+        let mut esperado = tree_files(&ctx, "/r");
+        let obtenido = esperado.clone();
+        esperado.sort();
+        assert_eq!(obtenido, esperado, "tree_files devuelve rutas ordenadas");
+    }
+
+    #[test]
+    fn apache_conf_available_deshabilitado_no_afecta() {
+        // apache2.conf incluye conf-enabled/*.conf y trae ServerTokens Prod. Un archivo en
+        // conf-available/ con ServerTokens OS que NO está enlazado en conf-enabled/ no se
+        // carga, así que no cambia el veredicto (y 'sin ServerTokens' seguiría exponiendo).
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "ServerTokens Prod\nIncludeOptional conf-enabled/*.conf\n")
+            .file("/etc/apache2/conf-available/security.conf", "ServerTokens OS\n");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Pass, "un conf-available deshabilitado no carga");
+    }
+
+    #[test]
+    fn apache_conf_enabled_si_afecta() {
+        // El mismo archivo, ahora enlazado en conf-enabled/: se carga y su ServerTokens OS,
+        // posterior en orden de carga, anula a la Prod del archivo principal.
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "ServerTokens Prod\nIncludeOptional conf-enabled/*.conf\n")
+            .file("/etc/apache2/conf-available/security.conf", "ServerTokens OS\n")
+            .symlink("/etc/apache2/conf-enabled/security.conf", "../conf-available/security.conf");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Warn, "el conf-enabled enlazado sí carga");
+    }
+
+    #[test]
+    fn apache_conf_enabled_endurece() {
+        // Un conf-enabled posterior con ServerTokens Prod endurece sobre un OS del principal.
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "ServerTokens OS\nIncludeOptional conf-enabled/*.conf\n")
+            .file("/etc/apache2/conf-available/hard.conf", "ServerTokens Prod\n")
+            .symlink("/etc/apache2/conf-enabled/hard.conf", "../conf-available/hard.conf");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Pass, "el conf-enabled endurece en orden de carga");
+    }
+
+    #[test]
+    fn apache_directiva_despues_del_include_gana() {
+        // En orden de carga, una ServerTokens posterior al IncludeOptional en apache2.conf
+        // gana sobre la del archivo incluido (Prod enlazado, luego Full en el principal).
+        let f = Fixture::new();
+        f.file("/etc/apache2/apache2.conf", "IncludeOptional conf-enabled/*.conf\nServerTokens Full\n")
+            .file("/etc/apache2/conf-available/tokens.conf", "ServerTokens Prod\n")
+            .symlink("/etc/apache2/conf-enabled/tokens.conf", "../conf-available/tokens.conf");
+        assert_eq!(f.run(run)["APP-050"].status, Status::Warn, "la directiva tras el Include gana");
+    }
+
+    #[test]
+    fn nginx_on_en_http_con_off_en_un_server_advierte() {
+        // server_tokens on en http (hereda a todos los server) y off en un solo server: los
+        // demás server siguen exponiendo la versión, así que advierte.
+        let f = Fixture::new();
+        f.file("/etc/nginx/nginx.conf", "http {\n\tserver_tokens on;\n\tserver {\n\t\tserver_tokens off;\n\t}\n}\n");
+        assert_eq!(f.run(run)["APP-052"].status, Status::Warn, "un on en http expone aunque un server lo apague");
+    }
+
+    #[test]
+    fn nginx_no_lee_sites_available_sin_enlazar() {
+        // http tiene server_tokens off correcto; un vhost en sites-available/ (no enlazado en
+        // sites-enabled/) con server_tokens on NO se carga, así que no cambia el veredicto.
+        let f = Fixture::new();
+        f.file("/etc/nginx/nginx.conf", "http {\n\tserver_tokens off;\n\tinclude /etc/nginx/sites-enabled/*;\n}\n")
+            .file("/etc/nginx/sites-available/default", "server {\n\tserver_tokens on;\n}\n");
+        assert_eq!(f.run(run)["APP-052"].status, Status::Pass, "sites-available sin enlazar no se lee");
+    }
+
+    #[test]
+    fn nginx_sites_enabled_enlazado_si_se_lee() {
+        // El mismo vhost, ahora enlazado en sites-enabled/: se carga y su server_tokens on
+        // expone la versión pese al off a nivel http.
+        let f = Fixture::new();
+        f.file("/etc/nginx/nginx.conf", "http {\n\tserver_tokens off;\n\tinclude /etc/nginx/sites-enabled/*;\n}\n")
+            .file("/etc/nginx/sites-available/default", "server {\n\tserver_tokens on;\n}\n")
+            .symlink("/etc/nginx/sites-enabled/default", "../sites-available/default");
+        assert_eq!(f.run(run)["APP-052"].status, Status::Warn, "un sitio habilitado con on se lee");
+    }
+
+    #[test]
+    fn nginx_llaves_de_regex_entre_comillas_no_desincronizan() {
+        // Una location con un regex entre comillas que lleva un cuantificador {4} no debe
+        // desincronizar el conteo de llaves: el server_tokens off queda en el contexto
+        // location (dentro de server), no se atribuye a http, así que sin off a nivel http
+        // APP-052 advierte.
+        let f = Fixture::new();
+        f.file(
+            "/etc/nginx/nginx.conf",
+            "http {\n\tserver {\n\t\tlocation ~ \"^/[0-9]{4}/\" {\n\t\t\tserver_tokens off;\n\t\t}\n\t}\n}\n",
+        );
+        assert_eq!(
+            f.run(run)["APP-052"].status,
+            Status::Warn,
+            "el off dentro de location no cuenta como off a nivel http"
+        );
+    }
+
+    #[test]
+    fn nginx_cuantificador_sin_comillas_no_desincroniza() {
+        // Un cuantificador de regex sin comillas ({2}) tampoco abre contexto: el off queda
+        // en location (dentro de server), no en http, así que APP-052 advierte.
+        let f = Fixture::new();
+        f.file(
+            "/etc/nginx/nginx.conf",
+            "http {\n\tserver {\n\t\tlocation ~ ^/x{2}$ {\n\t\t\tserver_tokens off;\n\t\t}\n\t}\n}\n",
+        );
+        assert_eq!(f.run(run)["APP-052"].status, Status::Warn, "un cuantificador sin comillas no abre bloque");
+    }
+
+    #[test]
+    fn nginx_comillas_escapadas_no_tragan_el_resto() {
+        // Una comilla escapada (\") dentro de un valor entre comillas (p. ej. add_header)
+        // no debe cerrar la cadena antes de tiempo ni tragarse el resto del archivo: el
+        // server_tokens on del server posterior debe verse, así que APP-052 advierte.
+        let f = Fixture::new();
+        f.file(
+            "/etc/nginx/nginx.conf",
+            "http {\n\tserver_tokens off;\n\tadd_header X-Foo \"a\\\"b\";\n\tserver {\n\t\tserver_tokens on;\n\t}\n}\n",
+        );
+        assert_eq!(
+            f.run(run)["APP-052"].status,
+            Status::Warn,
+            "las comillas escapadas no desincronizan el contexto"
+        );
+    }
+
+    #[test]
+    fn nginx_off_a_nivel_http_con_regex_en_location_pasa() {
+        // Control: con off a nivel http (que cubre todo) y una location con regex {4}, no hay
+        // on en ninguna parte, así que APP-052 pasa. Confirma que el parseo de llaves no
+        // rompe el caso seguro.
+        let f = Fixture::new();
+        f.file(
+            "/etc/nginx/nginx.conf",
+            "http {\n\tserver_tokens off;\n\tserver {\n\t\tlocation ~ \"^/[0-9]{4}/\" {\n\t\t}\n\t}\n}\n",
+        );
+        assert_eq!(f.run(run)["APP-052"].status, Status::Pass, "off a nivel http cubre todo");
     }
 }
