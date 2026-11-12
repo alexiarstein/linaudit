@@ -1074,10 +1074,6 @@ msgid "Detected applications: {list}"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "Tomcat: no AJP connector without a secret"
-msgstr ""
-
-#: crates/linaudit-core/src/checks/apps.rs
 msgid "Tomcat: AJP connector without a secret (Ghostcat)"
 msgstr ""
 
@@ -1086,7 +1082,7 @@ msgid "Disable AJP or set address=127.0.0.1 and a secret"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "Tomcat: no default credentials in tomcat-users.xml"
+msgid "Tomcat: no AJP connector without a secret"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -1098,7 +1094,7 @@ msgid "Change the password or remove the users"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "Tomcat: user passwords are not in plaintext"
+msgid "Tomcat: no default credentials in tomcat-users.xml"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -1107,6 +1103,10 @@ msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
 msgid "Use a CredentialHandler with a digest (SHA-256/bcrypt) in the Realm"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/apps.rs
+msgid "Tomcat: user passwords are not in plaintext"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -1134,15 +1134,15 @@ msgid "Run it as an unprivileged service user (port <1024 via proxy/authbind)"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "Redis: no unauthenticated network exposure"
-msgstr ""
-
-#: crates/linaudit-core/src/checks/apps.rs
 msgid "Redis exposed to the network WITHOUT authentication"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
 msgid "bind 127.0.0.1 or requirepass/ACL + firewall; never protected-mode no without a password"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/apps.rs
+msgid "Redis: no unauthenticated network exposure"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -1195,10 +1195,6 @@ msgid "Remove --privileged and the docker.sock mount unless justified"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "PostgreSQL: no 'trust' for network connections"
-msgstr ""
-
-#: crates/linaudit-core/src/checks/apps.rs
 msgid "PostgreSQL: pg_hba.conf allows 'trust' over the network"
 msgstr ""
 
@@ -1207,7 +1203,7 @@ msgid "Use scram-sha-256"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
-msgid "PostgreSQL: pg_hba.conf has no rules open to 0.0.0.0/0"
+msgid "PostgreSQL: no 'trust' for network connections"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -1216,6 +1212,10 @@ msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
 msgid "Restrict to the application networks"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/apps.rs
+msgid "PostgreSQL: pg_hba.conf has no rules open to 0.0.0.0/0"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/apps.rs
@@ -2759,6 +2759,15 @@ msgstr ""
 #: crates/linaudit-core/src/checks/util.rs
 #. {name} is replaced by a value: keep it exactly as is
 msgid "owner {owner} (expected {expected})"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/util.rs
+#. {name} is replaced by a value: keep it exactly as is
+msgid "cannot read {files} (not root?)"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/util.rs
+msgid "Grant read access so the audit can evaluate this file"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/util.rs

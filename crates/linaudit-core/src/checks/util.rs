@@ -108,6 +108,38 @@ pub fn read(ctx: &Context, abs: &str) -> Option<String> {
     std::fs::read_to_string(ctx.path(abs)).ok()
 }
 
+/// Resultado de leer una configuración relevante para la seguridad, distinguiendo
+/// "ausente" de "presente pero ilegible". `read` colapsa ambos casos en `None`, lo que
+/// permite que un archivo presente pero sin permiso de lectura se interprete como
+/// "sin directiva insegura" y produzca un PASS falso en un control crítico.
+pub enum ConfigRead {
+    /// El archivo no existe.
+    Absent,
+    /// El archivo existe pero no se pudo leer (permiso o error de E/S).
+    Unreadable,
+    /// Contenido leído correctamente.
+    Content(String),
+}
+
+/// Lee una configuración distinguiendo ausencia de "presente pero ilegible".
+pub fn read_config(ctx: &Context, abs: &str) -> ConfigRead {
+    match std::fs::read_to_string(ctx.path(abs)) {
+        Ok(t) => ConfigRead::Content(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigRead::Absent,
+        Err(_) => ConfigRead::Unreadable,
+    }
+}
+
+/// Un control cuya configuración está presente pero no se pudo leer queda
+/// indeterminado: Error, nunca PASS. Conserva el título propio del control y
+/// pone el motivo en el detalle, igual que ACC-002 ("cannot read ... (not root?)").
+pub fn unreadable<S: AsRef<str>>(em: &mut Emitter, id: &str, sev: Severity, title: &str, files: &[S]) {
+    let list = files.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+    em.error(id, sev, title)
+        .with_detail(tr!("cannot read {files} (not root?)", files = list))
+        .with_fix(tr!("Grant read access so the audit can evaluate this file"));
+}
+
 /// Valor de una clave en /etc/login.defs (gana la última aparición, como el awk de bash).
 pub fn login_defs_get(ctx: &Context, key: &str) -> Option<String> {
     let text = read(ctx, "/etc/login.defs")?;

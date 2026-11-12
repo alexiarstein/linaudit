@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use regex::{Regex, RegexBuilder};
 
 use super::Context;
-use super::util::{expand_all, find_command, live_command_full, read};
+use super::util::{ConfigRead, expand_all, find_command, live_command_full, read, read_config, unreadable};
 use super::walk::{WalkOpts, glob_match, walk};
 use crate::model::{Emitter, ResultExt, Severity::*};
 use crate::trc;
@@ -114,24 +114,36 @@ fn tomcat(ctx: &Context, em: &mut Emitter, procs: &[(String, String)], detected:
     });
 
     let (mut ajp, mut weak, mut plain, mut wapps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Archivos presentes pero ilegibles: sin su contenido no se puede concluir "seguro".
+    let (mut ajp_unread, mut users_unread) = (Vec::new(), Vec::new());
     for sx in &configs {
         let cdir = sx.rsplit_once('/').map_or("", |(d, _)| d).to_string();
         let parent = cdir.rsplit_once('/').map_or("", |(d, _)| d).to_string();
         // AJP sin secret (Ghostcat, CVE-2020-1938)
-        let xml = xml_nocomments(&read(ctx, sx).unwrap_or_default()).replace('\n', " ");
-        if CONNECTOR.find_iter(&xml).any(|m| !SECRET.is_match(m.as_str())) {
-            ajp.push(sx.clone());
+        match read_config(ctx, sx) {
+            ConfigRead::Content(raw) => {
+                let xml = xml_nocomments(&raw).replace('\n', " ");
+                if CONNECTOR.find_iter(&xml).any(|m| !SECRET.is_match(m.as_str())) {
+                    ajp.push(sx.clone());
+                }
+            }
+            ConfigRead::Unreadable => ajp_unread.push(sx.clone()),
+            ConfigRead::Absent => {}
         }
         let ux = format!("{cdir}/tomcat-users.xml");
-        if let Some(t) = read(ctx, &ux) {
-            let flat = xml_nocomments(&t).replace('\n', " ");
-            let users: Vec<&str> = USER.find_iter(&flat).map(|m| m.as_str()).collect();
-            if users.iter().any(|u| WEAK.is_match(u)) {
-                weak.push(ux.clone());
+        match read_config(ctx, &ux) {
+            ConfigRead::Content(t) => {
+                let flat = xml_nocomments(&t).replace('\n', " ");
+                let users: Vec<&str> = USER.find_iter(&flat).map(|m| m.as_str()).collect();
+                if users.iter().any(|u| WEAK.is_match(u)) {
+                    weak.push(ux.clone());
+                }
+                if users.iter().any(|u| u.to_lowercase().contains("password=\"")) {
+                    plain.push(ux.clone());
+                }
             }
-            if users.iter().any(|u| u.to_lowercase().contains("password=\"")) {
-                plain.push(ux.clone());
-            }
+            ConfigRead::Unreadable => users_unread.push(ux.clone()),
+            ConfigRead::Absent => {}
         }
         let base = parent.rsplit('/').next().unwrap_or("");
         let mut dirs = vec![format!("{parent}/webapps"), format!("/var/lib/{base}/webapps")];
@@ -151,26 +163,32 @@ fn tomcat(ctx: &Context, em: &mut Emitter, procs: &[(String, String)], detected:
     wapps.dedup();
     wapps.truncate(6);
 
-    if ajp.is_empty() {
-        em.pass("APP-001", High, tr!("Tomcat: no AJP connector without a secret"));
-    } else {
+    if !ajp.is_empty() {
         em.fail("APP-001", High, tr!("Tomcat: AJP connector without a secret (Ghostcat)"))
             .with_detail(ajp.join(" "))
             .with_fix(tr!("Disable AJP or set address=127.0.0.1 and a secret"));
-    }
-    if weak.is_empty() {
-        em.pass("APP-002", Critical, tr!("Tomcat: no default credentials in tomcat-users.xml"));
+    } else if !ajp_unread.is_empty() {
+        unreadable(em, "APP-001", High, tr!("Tomcat: AJP connector without a secret (Ghostcat)"), &ajp_unread);
     } else {
+        em.pass("APP-001", High, tr!("Tomcat: no AJP connector without a secret"));
+    }
+    if !weak.is_empty() {
         em.fail("APP-002", Critical, tr!("Tomcat: users with a default/trivial password"))
             .with_detail(weak.join(" "))
             .with_fix(tr!("Change the password or remove the users"));
-    }
-    if plain.is_empty() {
-        em.pass("APP-003", Low, tr!("Tomcat: user passwords are not in plaintext"));
+    } else if !users_unread.is_empty() {
+        unreadable(em, "APP-002", Critical, tr!("Tomcat: users with a default/trivial password"), &users_unread);
     } else {
+        em.pass("APP-002", Critical, tr!("Tomcat: no default credentials in tomcat-users.xml"));
+    }
+    if !plain.is_empty() {
         em.warn("APP-003", Low, tr!("Tomcat: plaintext passwords in tomcat-users.xml"))
             .with_detail(plain.join(" "))
             .with_fix(tr!("Use a CredentialHandler with a digest (SHA-256/bcrypt) in the Realm"));
+    } else if !users_unread.is_empty() {
+        unreadable(em, "APP-003", Low, tr!("Tomcat: plaintext passwords in tomcat-users.xml"), &users_unread);
+    } else {
+        em.pass("APP-003", Low, tr!("Tomcat: user passwords are not in plaintext"));
     }
     if wapps.is_empty() {
         em.pass("APP-004", Medium, tr!("Tomcat: no manager/examples/docs deployed"));
@@ -219,7 +237,15 @@ pub fn redis_exposed(conf: &str) -> bool {
 fn redis(ctx: &Context, em: &mut Emitter, procs: &[(String, String)], detected: &mut Vec<&str>) {
     let mut confs: Vec<String> = vec!["/etc/redis/redis.conf".into(), "/etc/redis.conf".into()];
     confs.extend(expand_all(ctx, &["/etc/redis/*.conf", "/usr/local/etc/redis/*.conf"]));
-    confs.retain(|f| std::fs::File::open(ctx.path(f)).is_ok());
+    // La presencia debe ser independiente del permiso de lectura: un redis.conf
+    // presente pero ilegible tiene que sobrevivir hasta read_config y forzar el
+    // camino Unreadable->Error, nunca un PASS falso en APP-010 (critico).
+    // try_exists().unwrap_or(false) no basta: en Debian /etc/redis es 0750
+    // redis:redis, asi que un no-root no puede ni hacer stat de redis.conf
+    // (EACCES por el directorio) y try_exists devuelve Err, que unwrap_or(false)
+    // convertia en "ausente", descartando el archivo. Se conserva la ruta salvo
+    // que este DEFINITIVAMENTE ausente (Ok(false)); Err (ilegible) se conserva.
+    confs.retain(|f| !matches!(ctx.path(f).try_exists(), Ok(false)));
     let mut seen = std::collections::HashSet::new();
     confs.retain(|f| seen.insert(f.clone()));
     let running = procs.iter().any(|(_, a)| a.contains("redis-server"));
@@ -227,14 +253,26 @@ fn redis(ctx: &Context, em: &mut Emitter, procs: &[(String, String)], detected: 
         return;
     }
     detected.push("redis");
-    let exposed: Vec<&str> =
-        confs.iter().filter(|f| read(ctx, f).is_some_and(|t| redis_exposed(&t))).map(String::as_str).collect();
-    if exposed.is_empty() {
-        em.pass("APP-010", Critical, tr!("Redis: no unauthenticated network exposure"));
-    } else {
+    let (mut exposed, mut unread): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for f in &confs {
+        match read_config(ctx, f) {
+            ConfigRead::Content(t) => {
+                if redis_exposed(&t) {
+                    exposed.push(f.as_str());
+                }
+            }
+            ConfigRead::Unreadable => unread.push(f.as_str()),
+            ConfigRead::Absent => {}
+        }
+    }
+    if !exposed.is_empty() {
         em.fail("APP-010", Critical, tr!("Redis exposed to the network WITHOUT authentication"))
             .with_detail(exposed.join(" "))
             .with_fix(tr!("bind 127.0.0.1 or requirepass/ACL + firewall; never protected-mode no without a password"));
+    } else if !unread.is_empty() {
+        unreadable(em, "APP-010", Critical, tr!("Redis exposed to the network WITHOUT authentication"), &unread);
+    } else {
+        em.pass("APP-010", Critical, tr!("Redis: no unauthenticated network exposure"));
     }
     if procs.iter().any(|(u, a)| u == "root" && a.contains("redis-server")) {
         em.fail("APP-011", High, tr!("Redis runs as root")).with_detail("root: redis-server").with_fix(tr!("Run it as the 'redis' user"));
@@ -260,6 +298,9 @@ fn docker(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
             em.pass("APP-020", Critical, tr!("docker.sock is not world-writable"));
         }
     }
+    // /etc/group es legible por todos en cualquier sistema sano, asi que no se
+    // trata como "presente pero ilegible": se lee directamente (no es un control
+    // de configuracion sensible a permisos como los demas de este modulo).
     let members = read(ctx, "/etc/group")
         .unwrap_or_default()
         .lines()
@@ -314,9 +355,17 @@ fn postgres(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
         return;
     }
     detected.push("postgresql");
-    let (mut trust, mut open) = (Vec::new(), Vec::new());
+    let (mut trust, mut open, mut unread) = (Vec::new(), Vec::new(), Vec::new());
     for f in &hba {
-        for l in strip_hash(&read(ctx, f).unwrap_or_default()).lines() {
+        let text = match read_config(ctx, f) {
+            ConfigRead::Content(t) => t,
+            ConfigRead::Unreadable => {
+                unread.push(f.clone());
+                continue;
+            }
+            ConfigRead::Absent => continue,
+        };
+        for l in strip_hash(&text).lines() {
             let w: Vec<&str> = l.split_whitespace().collect();
             if !w.first().is_some_and(|t| t.starts_with("host")) {
                 continue;
@@ -331,22 +380,35 @@ fn postgres(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
     }
     trust.truncate(3);
     open.dedup();
-    if trust.is_empty() {
-        em.pass("APP-030", High, tr!("PostgreSQL: no 'trust' for network connections"));
-    } else {
+    unread.dedup();
+    if !trust.is_empty() {
         em.fail("APP-030", High, tr!("PostgreSQL: pg_hba.conf allows 'trust' over the network")).with_detail(trust.join("; ")).with_fix(tr!("Use scram-sha-256"));
-    }
-    if open.is_empty() {
-        em.pass("APP-031", Medium, tr!("PostgreSQL: pg_hba.conf has no rules open to 0.0.0.0/0"));
+    } else if !unread.is_empty() {
+        unreadable(em, "APP-030", High, tr!("PostgreSQL: pg_hba.conf allows 'trust' over the network"), &unread);
     } else {
+        em.pass("APP-030", High, tr!("PostgreSQL: no 'trust' for network connections"));
+    }
+    if !open.is_empty() {
         em.warn("APP-031", Medium, tr!("PostgreSQL: rules open to any source (0.0.0.0/0)"))
             .with_detail(open.join(" "))
             .with_fix(tr!("Restrict to the application networks"));
+    } else if !unread.is_empty() {
+        unreadable(em, "APP-031", Medium, tr!("PostgreSQL: rules open to any source (0.0.0.0/0)"), &unread);
+    } else {
+        em.pass("APP-031", Medium, tr!("PostgreSQL: pg_hba.conf has no rules open to 0.0.0.0/0"));
     }
 }
 
 fn samba(ctx: &Context, em: &mut Emitter, detected: &mut Vec<&str>) {
-    let Some(conf) = read(ctx, "/etc/samba/smb.conf") else { return };
+    let conf = match read_config(ctx, "/etc/samba/smb.conf") {
+        ConfigRead::Content(c) => c,
+        ConfigRead::Absent => return,
+        ConfigRead::Unreadable => {
+            detected.push("samba");
+            unreadable(em, "APP-040", Medium, tr!("Samba allows guest access"), &["/etc/samba/smb.conf"]);
+            return;
+        }
+    };
     detected.push("samba");
     static GUEST: LazyLock<Regex> = LazyLock::new(|| {
         ci(r"guest ok[[:space:]]*=[[:space:]]*(yes|true)|map to guest[[:space:]]*=[[:space:]]*bad user|security[[:space:]]*=[[:space:]]*share")
@@ -494,6 +556,104 @@ mod tests {
         let r = f.run(run);
         assert_eq!(r["APP-010"].detail, "/etc/redis/redis.conf", "sin repetir el archivo");
         assert_eq!(r["APP-011"].status, Status::Fail);
+    }
+
+    #[test]
+    fn redis_conf_presente_pero_ilegible_no_es_pass() {
+        // Un archivo presente pero que no se puede leer (aquí un directorio con el
+        // nombre del conf: produce un error de E/S, no "no existe") no debe dar PASS:
+        // sin su contenido no se puede concluir que Redis esté protegido.
+        let f = Fixture::new();
+        f.dir("/etc/redis/redis.conf");
+        let r = f.run(run);
+        assert_eq!(r["APP-010"].status, Status::Error, "config ilegible no puede ser PASS");
+        assert!(r["APP-010"].detail.contains("/etc/redis/redis.conf"));
+    }
+
+    #[test]
+    fn redis_conf_ilegible_por_permisos_no_es_pass() {
+        // Caso primario del hallazgo: un redis.conf presente pero SIN permiso de
+        // lectura (EACCES), un archivo normal, no un directorio. El filtro de
+        // presencia debe ser independiente de la lectura; con el viejo
+        // File::open().is_ok() el archivo se descartaba antes de read_config y
+        // APP-010 (critico) daba un PASS falso. Este test regresa ese bug: contra
+        // el filtro viejo el archivo desaparece y APP-010 no se emite.
+        let f = Fixture::new();
+        f.file("/etc/redis/redis.conf", "bind 0.0.0.0\n").mode("/etc/redis/redis.conf", 0o000);
+        // root ignora los bits de modo, asi que no se puede provocar EACCES como
+        // root. Se detecta sin dependencias nuevas intentando leer el archivo: si
+        // sigue siendo legible, se omite este caso (no hay EACCES que probar).
+        if std::fs::read_to_string(f.ctx().path("/etc/redis/redis.conf")).is_ok() {
+            return;
+        }
+        let r = f.run(run);
+        assert_eq!(r["APP-010"].status, Status::Error, "redis.conf ilegible (EACCES) no puede ser PASS");
+        assert!(r["APP-010"].detail.contains("/etc/redis/redis.conf"));
+    }
+
+    #[test]
+    fn redis_dir_ilegible_no_es_pass() {
+        // Caso del DIRECTORIO ilegible (el que reportó la revisión): en Debian
+        // /etc/redis es 0750 redis:redis, asi que un no-root no puede ni hacer
+        // stat de /etc/redis/redis.conf: try_exists() devuelve Err(EACCES). El
+        // filtro de presencia debe conservar la ruta salvo que este
+        // DEFINITIVAMENTE ausente (Ok(false)) para que read_config la marque
+        // Unreadable->Error. Con el viejo try_exists().unwrap_or(false) la ruta
+        // se descartaba y APP-010 (critico) no se emitia: PASS/omision falsa.
+        let f = Fixture::new();
+        f.file("/etc/redis/redis.conf", "bind 0.0.0.0\n").mode("/etc/redis", 0o000);
+        // root ignora los bits de modo; si aun se puede leer el archivo a traves
+        // del directorio, no hay EACCES que probar: se omite el caso (y se
+        // restaura el modo para que Fixture::drop pueda limpiar el directorio).
+        if std::fs::read_to_string(f.ctx().path("/etc/redis/redis.conf")).is_ok() {
+            f.mode("/etc/redis", 0o755);
+            return;
+        }
+        let r = f.run(run);
+        f.mode("/etc/redis", 0o755);
+        assert_eq!(r["APP-010"].status, Status::Error, "directorio de redis ilegible no puede ser PASS");
+        assert!(r["APP-010"].detail.contains("/etc/redis/redis.conf"));
+    }
+
+    #[test]
+    fn postgres_hba_presente_pero_ilegible_no_es_pass() {
+        // pg_hba.conf presente pero ilegible: el control de 'trust' queda indeterminado,
+        // nunca PASS (antes, read(...).unwrap_or_default() lo convertía en un PASS falso).
+        let f = Fixture::new();
+        f.dir("/etc/postgresql/16/main/pg_hba.conf");
+        let r = f.run(run);
+        assert_eq!(r["APP-030"].status, Status::Error, "APP-030 no puede ser PASS si no se leyo pg_hba.conf");
+        assert_eq!(r["APP-031"].status, Status::Error);
+        assert!(r["APP-030"].detail.contains("/etc/postgresql/16/main/pg_hba.conf"));
+    }
+
+    #[test]
+    fn tomcat_users_presente_pero_ilegible_no_es_pass() {
+        // server.xml legible (hace falta para detectar Tomcat) pero tomcat-users.xml
+        // presente e ilegible (aquí un directorio con su nombre: error de E/S, no
+        // "no existe"): sin su contenido no se puede concluir que no haya credenciales
+        // por defecto ni contraseñas en claro. APP-002/003 quedan en Error, nunca PASS.
+        let f = Fixture::new();
+        f.file(
+            "/opt/tomcat/conf/server.xml",
+            "<Server><Service name=\"Catalina\"></Service></Server>\n",
+        )
+        .dir("/opt/tomcat/conf/tomcat-users.xml");
+        let r = f.run(run);
+        assert_eq!(r["APP-002"].status, Status::Error, "tomcat-users.xml ilegible no puede ser PASS");
+        assert_eq!(r["APP-003"].status, Status::Error);
+        assert!(r["APP-002"].detail.contains("/opt/tomcat/conf/tomcat-users.xml"));
+    }
+
+    #[test]
+    fn samba_conf_presente_pero_ilegible_no_es_pass() {
+        // smb.conf presente pero ilegible (un directorio con su nombre: error de E/S,
+        // no "no existe"): el control de acceso guest queda indeterminado, nunca PASS.
+        let f = Fixture::new();
+        f.dir("/etc/samba/smb.conf");
+        let r = f.run(run);
+        assert_eq!(r["APP-040"].status, Status::Error, "smb.conf ilegible no puede ser PASS");
+        assert!(r["APP-040"].detail.contains("/etc/samba/smb.conf"));
     }
 
     #[test]
