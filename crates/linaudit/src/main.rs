@@ -77,12 +77,18 @@ fn run(args: Args, lang_source: lang::Source) -> Result<ExitCode, String> {
         }
         waiver_files.push(w.clone());
     }
+    for r in &args.rules_dir {
+        if !r.exists() {
+            return Err(tr!("rules path {path} does not exist", path = r.display()));
+        }
+    }
     let opts = AuditOptions {
         profile,
         profile_source,
         categories: args.category.clone(),
         fast: args.fast,
         waivers: Waivers::load(&waiver_files),
+        rules_dirs: args.rules_dir.clone(),
     };
 
     let now = jiff::Zoned::now();

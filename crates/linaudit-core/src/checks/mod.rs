@@ -38,6 +38,8 @@ pub struct Context {
     pub active_services: Option<HashSet<String>>,
     /// Momento de la auditoría (segundos Unix). Fijo en tests para fechas reproducibles.
     pub now_unix: i64,
+    /// Directorios o archivos adicionales con reglas SCA en formato YAML.
+    pub rules_dirs: Vec<PathBuf>,
 }
 
 impl Context {
@@ -46,7 +48,20 @@ impl Context {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        Context { os, root, fast, fs_root: PathBuf::from("/"), active_services: None, now_unix }
+        Context {
+            os,
+            root,
+            fast,
+            fs_root: PathBuf::from("/"),
+            active_services: None,
+            now_unix,
+            rules_dirs: Vec::new(),
+        }
+    }
+
+    pub fn with_rules_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.rules_dirs = dirs;
+        self
     }
 
     /// Traduce una ruta absoluta del sistema auditado a la ruta real a leer.
@@ -107,6 +122,11 @@ pub static MODULES: &[Module] = &[
         run: hardening::run,
     },
     Module { category: "apps", description: crate::N_!("Tomcat, Redis, Docker, PostgreSQL, Samba, Apache and nginx"), run: apps::run },
+    Module {
+        category: "sca",
+        description: crate::N_!("Security Configuration Assessment (SCA YAML rules)"),
+        run: crate::sca::run,
+    },
 ];
 
 pub fn categories() -> Vec<&'static str> {

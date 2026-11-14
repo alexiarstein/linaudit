@@ -62,6 +62,10 @@ msgid "Extra waivers file, besides /etc/linaudit/waivers.conf."
 msgstr ""
 
 #: crates/linaudit/src/cli.rs
+msgid "Directory or file with YAML compliance rules (SCA), besides /etc/linaudit/rules.d."
+msgstr ""
+
+#: crates/linaudit/src/cli.rs
 msgid "Save the report to FILE (mode 600) instead of printing it."
 msgstr ""
 
@@ -132,6 +136,11 @@ msgstr ""
 #: crates/linaudit/src/main.rs
 #. {name} is replaced by a value: keep it exactly as is
 msgid "waivers file {path} does not exist"
+msgstr ""
+
+#: crates/linaudit/src/main.rs
+#. {name} is replaced by a value: keep it exactly as is
+msgid "rules path {path} does not exist"
 msgstr ""
 
 #: crates/linaudit/src/main.rs
@@ -1763,6 +1772,10 @@ msgstr ""
 
 #: crates/linaudit-core/src/checks/mod.rs
 msgid "Tomcat, Redis, Docker, PostgreSQL, Samba, Apache and nginx"
+msgstr ""
+
+#: crates/linaudit-core/src/checks/mod.rs
+msgid "Security Configuration Assessment (SCA YAML rules)"
 msgstr ""
 
 #: crates/linaudit-core/src/checks/mod.rs
