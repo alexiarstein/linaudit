@@ -1,3 +1,5 @@
+%bcond_without check
+
 %global debug_package %{nil}
 
 Name:           linaudit
@@ -38,11 +40,32 @@ if [ ${#dirs[@]} -eq 1 ] && [ -d "${dirs[0]}" ]; then
 fi
 shopt -u dotglob nullglob
 
+# Configure Cargo for offline vendored builds if vendor/ directory is present
+if [ -d vendor ]; then
+    mkdir -p .cargo
+    cat >> .cargo/config.toml << 'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+fi
+
 %build
-cargo build --release --workspace
+export RUSTFLAGS="%{?build_rustflags:%build_rustflags}"
+if [ -d vendor ]; then
+    export CARGO_OFFLINE="--offline"
+fi
+cargo build --release --workspace ${CARGO_OFFLINE:-}
 
 %check
-cargo test --release --workspace
+%if %{with check}
+if [ -d vendor ]; then
+    export CARGO_OFFLINE="--offline"
+fi
+cargo test --workspace ${CARGO_OFFLINE:-}
+%endif
 
 %install
 # Binary
@@ -98,5 +121,6 @@ LINAUDIT_LANG=en ./target/release/linaudit --completions fish > %{buildroot}%{_d
 %{_datadir}/fish/vendor_completions.d/linaudit.fish
 
 %changelog
-* Thu Nov 12 2026 Scott R. Shinn <scott@atomicrocketturtle.com> - 0.2.0-1
+* Thu Nov 12 2026 Scott R. Shinn <scott@atomicorp.com> - 0.2.0-1
 - Initial RPM packaging for linaudit 0.2.0
+- Add vendor/ offline build support and %%check condition

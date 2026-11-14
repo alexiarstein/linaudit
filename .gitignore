@@ -31,3 +31,8 @@ bin-release/
 /debian/*.substvars
 /debian/*.debhelper.log
 /debian/Cargo.lock.upstream
+
+# RPM and archive build artifacts
+*.tar.gz
+*.tar.gz.*
+/vendor/
