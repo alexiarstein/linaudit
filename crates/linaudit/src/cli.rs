@@ -73,6 +73,11 @@ pub struct Args {
     #[arg(long, value_name = "FILE", help = N_!("Extra waivers file, besides /etc/linaudit/waivers.conf."))]
     pub waivers: Option<PathBuf>,
 
+    #[arg(long = "rules-dir", alias = "rules", value_delimiter = ',', value_name = "DIR", help = N_!(
+        "Directory or file with YAML compliance rules (SCA), besides /etc/linaudit/rules.d."
+    ))]
+    pub rules_dir: Vec<PathBuf>,
+
     #[arg(long, value_name = "FILE", help = N_!("Save the report to FILE (mode 600) instead of printing it."))]
     pub output: Option<PathBuf>,
 

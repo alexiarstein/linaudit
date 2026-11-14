@@ -69,6 +69,10 @@ msgid "Extra waivers file, besides /etc/linaudit/waivers.conf."
 msgstr "Archivo extra de excepciones, además de /etc/linaudit/waivers.conf."
 
 #: crates/linaudit/src/cli.rs
+msgid "Directory or file with YAML compliance rules (SCA), besides /etc/linaudit/rules.d."
+msgstr "Directorio o archivo con reglas de cumplimiento en YAML (SCA), además de /etc/linaudit/rules.d."
+
+#: crates/linaudit/src/cli.rs
 msgid "Save the report to FILE (mode 600) instead of printing it."
 msgstr "Guardar el reporte en FILE (permisos 600) en vez de imprimirlo."
 
@@ -140,6 +144,11 @@ msgstr "menú: {e}"
 #: crates/linaudit/src/main.rs
 msgid "waivers file {path} does not exist"
 msgstr "no existe el archivo de excepciones {path}"
+
+#. {name} is replaced by a value: keep it exactly as is
+#: crates/linaudit/src/main.rs
+msgid "rules path {path} does not exist"
+msgstr "no existe la ruta de reglas {path}"
 
 #. {name} is replaced by a value: keep it exactly as is
 #: crates/linaudit/src/main.rs
@@ -1745,6 +1754,10 @@ msgstr "MAC, auditoría, hora, logs, parámetros de kernel y servicios"
 #: crates/linaudit-core/src/checks/mod.rs
 msgid "Tomcat, Redis, Docker, PostgreSQL, Samba, Apache and nginx"
 msgstr "Tomcat, Redis, Docker, PostgreSQL, Samba, Apache y nginx"
+
+#: crates/linaudit-core/src/checks/mod.rs
+msgid "Security Configuration Assessment (SCA YAML rules)"
+msgstr "Evaluación de configuración de seguridad (reglas YAML SCA)"
 
 #. {name} is replaced by a value: keep it exactly as is
 #: crates/linaudit-core/src/checks/mod.rs

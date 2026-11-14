@@ -175,3 +175,21 @@ El título es el del caso "cumple"; cuando falla, el reporte muestra el detalle 
 | APP-051 | MEDIUM | Apache: sin directory listing (Options Indexes) |
 | APP-052 | LOW | nginx: server_tokens off |
 | APP-053 | MEDIUM | nginx: sin autoindex |
+
+## sca
+
+Controles cargados dinámicamente desde archivos de políticas YAML en `/etc/linaudit/rules.d/` o directorios especificados mediante `--rules-dir`. Compatible con la sintaxis de Security Configuration Assessment (SCA) de Atomicorp / AWP Agent / Wazuh.
+
+| Sintaxis de regla | Descripción |
+|---|---|
+| `c:<cmd> -> r:<regex>` | El comando `<cmd>` debe devolver una salida que coincida con `<regex>` |
+| `not c:<cmd> -> r:<regex>` | La salida del comando `<cmd>` no debe coincidir con `<regex>` |
+| `f:<archivo> -> r:<regex>` | El contenido de `<archivo>` debe coincidir con `<regex>` |
+| `not f:<archivo> -> r:<regex>` | El contenido de `<archivo>` no debe coincidir con `<regex>` |
+| `d:<directorio> -> <ext> -> r:<regex>` | Los archivos con extensión `<ext>` en `<directorio>` deben coincidir con `<regex>` |
+
+Condiciones admitidas:
+- `all`: Todas las reglas deben cumplirse.
+- `any`: Al menos una regla debe cumplirse.
+- `none`: Ninguna regla debe cumplirse (ideal para detectar configuraciones vulnerables o credenciales expuestas).
+

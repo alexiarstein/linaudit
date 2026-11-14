@@ -64,6 +64,7 @@ impl Fixture {
             active_services: Some(self.services.clone()),
             // 2026-11-04 12:00 UTC
             now_unix: 1_793_793_600,
+            rules_dirs: Vec::new(),
         }
     }
 

@@ -1,15 +1,20 @@
 //! Modelo de resultados: severidad, estado y el resultado de un control.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Gravedad de un control. El orden de las variantes es el de mayor a menor gravedad.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Severity {
+    #[serde(alias = "critical", alias = "Critical")]
     Critical,
+    #[serde(alias = "high", alias = "High")]
     High,
+    #[serde(alias = "medium", alias = "Medium")]
     Medium,
+    #[serde(alias = "low", alias = "Low")]
     Low,
+    #[serde(alias = "info", alias = "Info")]
     Info,
 }
 

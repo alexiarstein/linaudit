@@ -5,6 +5,7 @@ pub mod checks;
 pub mod i18n;
 pub mod model;
 pub mod profile;
+pub mod sca;
 pub mod score;
 pub mod system;
 pub mod waivers;
@@ -43,6 +44,7 @@ pub struct AuditOptions {
     pub categories: Vec<String>,
     pub fast: bool,
     pub waivers: Waivers,
+    pub rules_dirs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,7 +70,8 @@ pub struct Report {
 pub fn audit(opts: &AuditOptions, timestamp: String, on_module: impl FnMut(&Module)) -> Report {
     let os = OsInfo::detect();
     let root = system::is_root();
-    let ctx = Context::new(os.clone(), root, opts.fast);
+    let mut ctx = Context::new(os.clone(), root, opts.fast);
+    ctx.rules_dirs = opts.rules_dirs.clone();
     let mut results = checks::run_all(&ctx, &opts.categories, on_module);
     profile::apply(opts.profile, &mut results);
     opts.waivers.apply(&mut results);

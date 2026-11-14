@@ -1,0 +1,20 @@
+# linaudit: Example Security Configuration Assessment (SCA) policy
+# Rename to .yml or add your custom YAML compliance policies in /etc/linaudit/rules.d/
+policy:
+  id: "sample-filesystem-hardening"
+  name: "Sample Hardening: Unused Filesystems"
+  description: "Ensures unused legacy filesystem kernel modules are disabled"
+
+checks:
+  - id: 9001
+    title: "Ensure cramfs module is disabled"
+    description: "The cramfs filesystem type is a compressed read-only Linux filesystem embedded in small footprint systems."
+    rationale: "Disabling unused filesystems reduces the local attack surface."
+    remediation: "echo 'install cramfs /bin/false' > /etc/modprobe.d/cramfs.conf"
+    severity: medium
+    condition: none
+    rules:
+      - "c:modprobe -n -v cramfs -> r:install /bin/false|Module cramfs not found"
+      - "not c:lsmod -> r:cramfs"
+      - "d:/etc/modprobe.d/ -> .conf -> r:^blacklist\\s+cramfs"
+
