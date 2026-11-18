@@ -25,6 +25,15 @@ qué tan grave es y cómo arreglarlo. Funciona en Debian, Ubuntu, RHEL y sus der
 sudo apt install linaudit
 ```
 
+**Gestor de paquetes Nix** (con los flakes habilitados):
+```bash
+# Rama main
+sudo nix run github:alexiarstein/linaudit
+
+# Otra rama
+sudo nix run github:alexiarstein/linaudit/<rama>
+```
+
 **Desde el código fuente** (hace falta Rust 1.85 o más nuevo):
 
 ```bash
@@ -124,7 +133,7 @@ sudo systemctl enable --now linaudit.timer
   Tomá los hallazgos como cosas para revisar, no como veredictos.
 - linaudit no reemplaza una auditoría formal de cumplimiento (CIS, STIG), un análisis forense ni un antivirus/EDR. Es
   un chequeo de salud rápido y honesto que podés correr todas las veces que quieras.
-- Los controles para la familia Red Hat (RHEL, Rocky, Alma, Fedora) están menos probados que los de Debian. Los
+- Los controles para la familia Red Hat (RHEL, Rocky, Alma, Fedora) y NixOS están menos probados que los de Debian. Los
   reportes y pull requests son muy bienvenidos.
 
 ## Más
